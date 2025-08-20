@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 WIKI_SPECIALS = {"_Sidebar.md", "_Footer.md", "_Header.md", "README.md"}
 
@@ -23,7 +23,7 @@ def run(cmd, cwd=None):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Convert a GitHub Wiki repo to a single DOCX via pandoc.")
-    p.add_argument("--repo", required=True, help="支持以下形式：.wiki.git、仓库 URL、Wiki 页面 URL、或本地路径")
+    p.add_argument("--repo", required=True, help="支持：.wiki.git、仓库 URL、Wiki 页面 URL、或本地路径（均可包含中文）")
     p.add_argument("--output", "-o", default="wiki.docx", help="输出 DOCX 文件名 (default: wiki.docx)")
     p.add_argument("--reference-docx", help="可选：自定义样式 .docx（传给 pandoc --reference-doc）")
     p.add_argument("--toc-depth", type=int, default=3, help="目录深度 (default: 3)")
@@ -36,8 +36,8 @@ def is_remote(s: str) -> bool:
 
 def to_wiki_git_remote(s: str) -> str:
     """
-    将常见的 GitHub 仓库 URL 或 Wiki 页面 URL 规范化为 .wiki.git 远程地址。
-    同时兼容已是 .wiki.git 的情形；兼容 git@ 形式。
+    将 GitHub 仓库 URL 或 Wiki 页面 URL 规范化为 .wiki.git 远程地址。
+    兼容已是 .wiki.git、git@ 形式、以及 URL 中的中文或 %xx 编码。
     """
     s = s.strip()
 
@@ -50,16 +50,19 @@ def to_wiki_git_remote(s: str) -> str:
         m = re.match(r"^git@([^:]+):([^/]+)/(.+?)(?:\.git|\.wiki\.git)?$", s)
         if m:
             host, owner, repo = m.groups()
+            # repo 不会出现中文（GitHub 限制），这里不做特殊处理
             if repo.endswith(".wiki"):
                 repo = repo[:-5]
             return f"git@{host}:{owner}/{repo}.wiki.git"
         return s
 
-    # http(s) 形式：处理 github.com/{owner}/{repo} 或 github.com/{owner}/{repo}/wiki/...
+    # http(s) 形式
     if s.startswith(("http://", "https://")):
         u = urlparse(s)
-        path = u.path.strip("/")
+        # 对 path 解码，避免中文/空格被 %xx 干扰
+        path = unquote(u.path).strip("/")
         parts = [p for p in path.split("/") if p]
+        # 期望至少 /owner/repo
         if len(parts) >= 2:
             owner = parts[0]
             repo = parts[1]
@@ -79,31 +82,61 @@ def clone_repo(repo_url: str) -> Path:
     return tmpdir
 
 def normalize_md_stem(name: str):
-    base = name.strip().strip("/")
+    # 先解码 URL 编码，并去掉锚点
+    base = unquote(name).strip().strip("/")
     base = base.split("#", 1)[0]
+    # 处理 wiki 页面绝对链接（.../wiki/<page>），提取末段作为页面名
+    if "/wiki/" in base:
+        base = base.split("/wiki/", 1)[-1].strip("/")
+    # 去掉 .md
     if base.lower().endswith(".md"):
         base = base[:-3]
+    # 多种候选：原文、空格->-、空格->_、%20 变体（unquote 已处理）
     candidates = [base, base.replace(" ", "-"), base.replace(" ", "_")]
-    candidates += [base.replace("%20", " "), base.replace("%20", "-"), base.replace("%20", "_")]
+    # 如果包含斜杠，wiki 通常是扁平的，尝试把斜杠替换为短横线
+    if "/" in base:
+        candidates.append(base.replace("/", "-"))
+    # 去重保持顺序
     seen = set()
     result = []
     for c in candidates:
-        if c not in seen:
+        if c and c not in seen:
             seen.add(c)
             result.append(c)
-    return result[0], result
+    return result[0] if result else "", result
 
 def find_md_by_link(working_dir: Path, link_target: str):
     _, stems = normalize_md_stem(link_target)
     candidates = []
     for stem in stems:
         candidates.append(working_dir / f"{stem}.md")
-        candidates.append(working_dir / stem / "Home.md")
-        candidates.append(working_dir / stem)
+        candidates.append(working_dir / stem / "Home.md")  # 少见，但尽量兼容
+        candidates.append(working_dir / stem)              # 直接给了 .md 的情况
     for c in candidates:
         if c.exists() and c.is_file() and c.suffix.lower() == ".md":
             return c
     return None
+
+def extract_targets_from_sidebar(text: str):
+    targets = []
+    for pat in LINK_PATTERNS:
+        for m in pat.findall(text):
+            raw = m[1] if isinstance(m, tuple) else m
+            target = unquote(raw.strip())
+            # 对绝对 URL 的 wiki 页面链接进行提取
+            if "://" in target:
+                try:
+                    u = urlparse(target)
+                    path = unquote(u.path)
+                    if "/wiki/" in path:
+                        target = path.split("/wiki/", 1)[-1].strip("/")
+                    else:
+                        # 非 wiki 页面，跳过（外链）
+                        continue
+                except Exception:
+                    continue
+            targets.append(target)
+    return targets
 
 def parse_sidebar_order(working_dir: Path):
     sidebar = working_dir / "_Sidebar.md"
@@ -112,14 +145,10 @@ def parse_sidebar_order(working_dir: Path):
         return order
     text = sidebar.read_text(encoding="utf-8", errors="ignore")
     found = []
-    for pat in LINK_PATTERNS:
-        for m in pat.findall(text):
-            target = m[1].strip() if isinstance(m, tuple) else m.strip()
-            if "://" in target:
-                continue
-            md = find_md_by_link(working_dir, target)
-            if md:
-                found.append(md)
+    for target in extract_targets_from_sidebar(text):
+        md = find_md_by_link(working_dir, target)
+        if md:
+            found.append(md)
     seen = set()
     for p in found:
         key = str(p.resolve())
@@ -159,7 +188,7 @@ def main():
         repo_input = args.repo.strip()
 
         # 本地路径优先
-        local_path = Path(repo_input).expanduser()
+        local_path = Path(unquote(repo_input)).expanduser()
         if local_path.exists() and local_path.is_dir():
             working_dir = local_path.resolve()
         else:
