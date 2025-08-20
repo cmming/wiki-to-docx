@@ -1,0 +1,50 @@
+name: Build DOCX from GitHub Wiki
+on:
+  workflow_dispatch:
+    inputs:
+      wiki_url:
+        description: "GitHub wiki git URL (.wiki.git)"
+        required: true
+        default: https://github.com/coze-dev/coze-studio.wiki.git
+      output_name:
+        description: "Output docx file name"
+        required: true
+        default: coze-studio-wiki.docx
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (for workflow + script)
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pandoc and git
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc git
+
+      - name: Convert wiki to docx
+        run: |
+          python convert_wiki_to_docx.py --repo "${{ github.event.inputs.wiki_url }}" --output "${{ github.event.inputs.output_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.output_name }}
+          path: ${{ github.event.inputs.output_name }}
+
+      - name: Create release with DOCX asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: wiki-docx-${{ github.run_id }}
+          name: Wiki DOCX ${{ github.run_id }}
+          body: "Auto-generated DOCX from ${{ github.event.inputs.wiki_url }}"
+          files: ${{ github.event.inputs.output_name }}
