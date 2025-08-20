@@ -1,15 +1,37 @@
-name: Build DOCX from GitHub Wiki
+name: Build DOCX from Web URL
 on:
   workflow_dispatch:
     inputs:
-      wiki_url:
-        description: "GitHub Wiki: 支持 .wiki.git、仓库 URL 或 wiki 页面 URL（可包含中文）"
+      page_url:
+        description: "要转换的网页 URL（支持中文与 % 编码）"
         required: true
-        default: https://github.com/coze-dev/coze-studio.wiki.git
+        type: string
+        default: https://zh.wikipedia.org/wiki/中文维基百科
       output_name:
-        description: "输出 docx 文件名（可包含中文与空格）"
+        description: "输出 DOCX 文件名（可包含中文与空格）"
         required: true
-        default: coze-studio-wiki.docx
+        type: string
+        default: page.docx
+      css_selector:
+        description: "可选：CSS 选择器提取主内容（如 #content, main, article）"
+        required: false
+        type: string
+        default: ""
+      readability:
+        description: "是否启用智能正文抽取（readability）"
+        required: false
+        type: boolean
+        default: true
+      toc:
+        description: "是否生成目录（根据页面标题层级）"
+        required: false
+        type: boolean
+        default: true
+      toc_depth:
+        description: "目录深度（1-6）"
+        required: false
+        type: number
+        default: 3
 
 permissions:
   contents: write
@@ -26,25 +48,62 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install pandoc and git
+      - name: Install pandoc
         run: |
           sudo apt-get update
-          sudo apt-get install -y pandoc git
+          sudo apt-get install -y pandoc
 
-      - name: Convert wiki to docx
+      - name: Install Python deps
         run: |
-          python convert_wiki_to_docx.py --repo "${{ github.event.inputs.wiki_url }}" --output "${{ github.event.inputs.output_name }}"
+          python -m pip install --upgrade pip
+          pip install readability-lxml beautifulsoup4 lxml chardet
+
+      - name: Prepare variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 兼容空值与默认值
+          URL="${{ github.event.inputs.page_url }}"
+          OUT="${{ github.event.inputs.output_name }}"
+          CSS="${{ github.event.inputs.css_selector }}"
+          READ="${{ github.event.inputs.readability }}"
+          TOC="${{ github.event.inputs.toc }}"
+          DEPTH="${{ github.event.inputs.toc_depth }}"
+
+          # 生成可直接拼接到命令行的 flags
+          [ -n "$CSS" ] && echo "css_flag=--css-selector=$CSS" >> $GITHUB_OUTPUT || echo "css_flag=" >> $GITHUB_OUTPUT
+          [ "$READ" = "true" ] && echo "readability_flag=--readability" >> $GITHUB_OUTPUT || echo "readability_flag=" >> $GITHUB_OUTPUT
+          if [ "$TOC" = "true" ]; then
+            echo "toc_flag=--toc" >> $GITHUB_OUTPUT
+            echo "toc_depth_flag=--toc-depth=$DEPTH" >> $GITHUB_OUTPUT
+          else
+            echo "toc_flag=" >> $GITHUB_OUTPUT
+            echo "toc_depth_flag=" >> $GITHUB_OUTPUT
+          fi
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "out=$OUT" >> $GITHUB_OUTPUT
+
+      - name: Convert URL to DOCX
+        run: |
+          python convert_url_to_docx.py \
+            --url "${{ steps.vars.outputs.url }}" \
+            --output "${{ steps.vars.outputs.out }}" \
+            ${{ steps.vars.outputs.readability_flag }} \
+            ${{ steps.vars.outputs.css_flag }} \
+            ${{ steps.vars.outputs.toc_flag }} \
+            ${{ steps.vars.outputs.toc_depth_flag }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.output_name }}
-          path: ${{ github.event.inputs.output_name }}
+          name: ${{ steps.vars.outputs.out }}
+          path: ${{ steps.vars.outputs.out }}
 
       - name: Create release with DOCX asset
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: wiki-docx-${{ github.run_id }}
-          name: Wiki DOCX ${{ github.run_id }}
-          body: "Auto-generated DOCX from ${{ github.event.inputs.wiki_url }}"
-          files: ${{ github.event.inputs.output_name }}
+          tag_name: url-docx-${{ github.run_id }}
+          name: URL DOCX ${{ github.run_id }}
+          body: "Auto-generated DOCX from ${{ steps.vars.outputs.url }}"
+          files: ${{ steps.vars.outputs.out }}

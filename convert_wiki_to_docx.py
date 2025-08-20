@@ -2,236 +2,217 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import re
-import shutil
-import subprocess
 import sys
 import tempfile
+import subprocess
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, urljoin, unquote
 
-WIKI_SPECIALS = {"_Sidebar.md", "_Footer.md", "_Header.md", "README.md"}
+import requests
+from bs4 import BeautifulSoup
 
-LINK_PATTERNS = [
-    re.compile(r"\[([^\]]+)\]\(([^)]+)\)"),   # [text](link)
-    re.compile(r"\[\[([^\]]+)\]\]"),          # [[Wiki Style]]
-]
+try:
+    from readability import Document
+    HAVE_READABILITY = True
+except Exception:
+    HAVE_READABILITY = False
+
 
 def run(cmd, cwd=None):
-    print(f"+ {' '.join(cmd)}", flush=True)
+    print("+ " + " ".join(cmd), flush=True)
     subprocess.check_call(cmd, cwd=cwd)
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Convert a GitHub Wiki repo to a single DOCX via pandoc.")
-    p.add_argument("--repo", required=True, help="支持：.wiki.git、仓库 URL、Wiki 页面 URL、或本地路径（均可包含中文）")
-    p.add_argument("--output", "-o", default="wiki.docx", help="输出 DOCX 文件名 (default: wiki.docx)")
-    p.add_argument("--reference-docx", help="可选：自定义样式 .docx（传给 pandoc --reference-doc）")
-    p.add_argument("--toc-depth", type=int, default=3, help="目录深度 (default: 3)")
-    p.add_argument("--keep-clone", action="store_true", help="若从远程克隆：保留临时目录")
-    return p.parse_args()
 
-def is_remote(s: str) -> bool:
-    s = s.strip()
-    return s.startswith(("http://", "https://", "git@"))
-
-def to_wiki_git_remote(s: str) -> str:
+def fetch_html(url: str, user_agent: str = None, timeout: int = 30) -> tuple[str, str]:
     """
-    将 GitHub 仓库 URL 或 Wiki 页面 URL 规范化为 .wiki.git 远程地址。
-    兼容已是 .wiki.git、git@ 形式、以及 URL 中的中文或 %xx 编码。
+    返回 (final_url, html_text)，会跟随重定向；尽量正确处理中文编码。
     """
-    s = s.strip()
+    headers = {
+        "User-Agent": user_agent or "Mozilla/5.0 (compatible; WikiToDocxBot/1.0; +https://github.com/cmming/wiki-to-docx)"
+    }
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
 
-    # 已是 .wiki.git
-    if s.endswith(".wiki.git"):
-        return s
+    # 尝试用服务器声明编码；若无则由 requests/chardet 猜测
+    if not resp.encoding:
+        resp.encoding = resp.apparent_encoding or "utf-8"
 
-    # git@ 形式：git@host:owner/repo(.git|.wiki.git)?
-    if s.startswith("git@"):
-        m = re.match(r"^git@([^:]+):([^/]+)/(.+?)(?:\.git|\.wiki\.git)?$", s)
-        if m:
-            host, owner, repo = m.groups()
-            # repo 不会出现中文（GitHub 限制），这里不做特殊处理
-            if repo.endswith(".wiki"):
-                repo = repo[:-5]
-            return f"git@{host}:{owner}/{repo}.wiki.git"
-        return s
+    html = resp.text
+    final_url = resp.url  # 可能经过 301/302
+    return final_url, html
 
-    # http(s) 形式
-    if s.startswith(("http://", "https://")):
-        u = urlparse(s)
-        # 对 path 解码，避免中文/空格被 %xx 干扰
-        path = unquote(u.path).strip("/")
-        parts = [p for p in path.split("/") if p]
-        # 期望至少 /owner/repo
-        if len(parts) >= 2:
-            owner = parts[0]
-            repo = parts[1]
-            # 去掉可能的 .git 或 .wiki 后缀
-            if repo.endswith(".git"):
-                repo = repo[:-4]
-            if repo.endswith(".wiki"):
-                repo = repo[:-5]
-            return f"{u.scheme}://{u.netloc}/{owner}/{repo}.wiki.git"
 
-    # 其他情况：原样返回（可能是本地路径或不可识别的远程）
-    return s
+def absolutize_resources(soup: BeautifulSoup, base_url: str):
+    """
+    将相对链接/图片等资源统一转为绝对 URL；去除 <script>。
+    """
+    # 删除脚本，避免干扰
+    for tag in soup.find_all(["script", "noscript"]):
+        tag.decompose()
 
-def clone_repo(repo_url: str) -> Path:
-    tmpdir = Path(tempfile.mkdtemp(prefix="wiki-clone-"))
-    run(["git", "clone", "--depth", "1", repo_url, str(tmpdir)])
-    return tmpdir
+    # 常见资源属性统一绝对化
+    attr_map = {
+        "a": ["href"],
+        "img": ["src", "srcset"],
+        "source": ["src", "srcset"],
+        "link": ["href"],
+        "video": ["src", "poster"],
+        "audio": ["src"],
+        "iframe": ["src"],
+    }
 
-def normalize_md_stem(name: str):
-    # 先解码 URL 编码，并去掉锚点
-    base = unquote(name).strip().strip("/")
-    base = base.split("#", 1)[0]
-    # 处理 wiki 页面绝对链接（.../wiki/<page>），提取末段作为页面名
-    if "/wiki/" in base:
-        base = base.split("/wiki/", 1)[-1].strip("/")
-    # 去掉 .md
-    if base.lower().endswith(".md"):
-        base = base[:-3]
-    # 多种候选：原文、空格->-、空格->_、%20 变体（unquote 已处理）
-    candidates = [base, base.replace(" ", "-"), base.replace(" ", "_")]
-    # 如果包含斜杠，wiki 通常是扁平的，尝试把斜杠替换为短横线
-    if "/" in base:
-        candidates.append(base.replace("/", "-"))
-    # 去重保持顺序
-    seen = set()
-    result = []
-    for c in candidates:
-        if c and c not in seen:
-            seen.add(c)
-            result.append(c)
-    return result[0] if result else "", result
-
-def find_md_by_link(working_dir: Path, link_target: str):
-    _, stems = normalize_md_stem(link_target)
-    candidates = []
-    for stem in stems:
-        candidates.append(working_dir / f"{stem}.md")
-        candidates.append(working_dir / stem / "Home.md")  # 少见，但尽量兼容
-        candidates.append(working_dir / stem)              # 直接给了 .md 的情况
-    for c in candidates:
-        if c.exists() and c.is_file() and c.suffix.lower() == ".md":
-            return c
-    return None
-
-def extract_targets_from_sidebar(text: str):
-    targets = []
-    for pat in LINK_PATTERNS:
-        for m in pat.findall(text):
-            raw = m[1] if isinstance(m, tuple) else m
-            target = unquote(raw.strip())
-            # 对绝对 URL 的 wiki 页面链接进行提取
-            if "://" in target:
-                try:
-                    u = urlparse(target)
-                    path = unquote(u.path)
-                    if "/wiki/" in path:
-                        target = path.split("/wiki/", 1)[-1].strip("/")
-                    else:
-                        # 非 wiki 页面，跳过（外链）
-                        continue
-                except Exception:
+    for tag_name, attrs in attr_map.items():
+        for el in soup.find_all(tag_name):
+            for attr in attrs:
+                val = el.get(attr)
+                if not val:
                     continue
-            targets.append(target)
-    return targets
+                if attr == "srcset":
+                    # 处理 srcset 多 URL
+                    parts = []
+                    for part in val.split(","):
+                        p = part.strip().split(" ")
+                        if p:
+                            p[0] = urljoin(base_url, p[0])
+                            parts.append(" ".join([x for x in p if x]))
+                    el[attr] = ", ".join(parts)
+                else:
+                    el[attr] = urljoin(base_url, val)
 
-def parse_sidebar_order(working_dir: Path):
-    sidebar = working_dir / "_Sidebar.md"
-    order = []
-    if not sidebar.exists():
-        return order
-    text = sidebar.read_text(encoding="utf-8", errors="ignore")
-    found = []
-    for target in extract_targets_from_sidebar(text):
-        md = find_md_by_link(working_dir, target)
-        if md:
-            found.append(md)
-    seen = set()
-    for p in found:
-        key = str(p.resolve())
-        if key not in seen and p.name not in WIKI_SPECIALS:
-            seen.add(key)
-            order.append(p)
-    return order
 
-def collect_md_files(working_dir: Path):
-    files = [p for p in working_dir.glob("*.md") if p.name not in WIKI_SPECIALS]
-    result = []
-    home = working_dir / "Home.md"
-    if home.exists():
-        result.append(home)
-    sidebar_order = parse_sidebar_order(working_dir)
-    for f in sidebar_order:
-        if f not in result:
-            result.append(f)
-    remaining = [f for f in files if f not in result]
-    remaining.sort(key=lambda p: p.name.lower())
-    result.extend(remaining)
-    return result
+def extract_main(html: str, base_url: str, css_selector: str | None, use_readability: bool) -> BeautifulSoup:
+    """
+    根据优先级提取主体内容：
+    1) 指定 CSS 选择器
+    2) readability（若可用且启用）
+    3) 常见语义容器 main/article/#content
+    4) 回退到 <body>
+    """
+    soup = BeautifulSoup(html, "lxml")
 
-def ensure_tools():
-    try:
-        subprocess.check_output(["pandoc", "-v"])
-    except Exception:
-        print("错误：未检测到 pandoc。请先安装 pandoc；参考：https://pandoc.org/installing.html", file=sys.stderr)
-        sys.exit(1)
+    # CSS 选择器优先
+    if css_selector:
+        el = soup.select_one(css_selector)
+        if el:
+            wrapper = BeautifulSoup("<html><head></head><body></body></html>", "lxml")
+            wrapper.head.append(wrapper.new_tag("meta", charset="utf-8"))
+            title_text = soup.title.string.strip() if soup.title and soup.title.string else base_url
+            title_tag = wrapper.new_tag("title")
+            title_tag.string = title_text
+            wrapper.head.append(title_tag)
+
+            # 复制选中节点内容
+            fragment = BeautifulSoup(str(el), "lxml")
+            wrapper.body.append(fragment)
+            return wrapper
+
+    # readability
+    if use_readability and HAVE_READABILITY:
+        try:
+            doc = Document(html)
+            title_text = doc.short_title() or (soup.title.string.strip() if soup.title and soup.title.string else base_url)
+            cleaned_html = doc.summary(html_partial=True)  # 仅主体片段
+            wrapper = BeautifulSoup("<html><head></head><body></body></html>", "lxml")
+            wrapper.head.append(wrapper.new_tag("meta", charset="utf-8"))
+            title_tag = wrapper.new_tag("title")
+            title_tag.string = title_text
+            wrapper.head.append(title_tag)
+            fragment = BeautifulSoup(cleaned_html, "lxml")
+            wrapper.body.append(fragment)
+            return wrapper
+        except Exception:
+            # 忽略提取失败，继续后续策略
+            pass
+
+    # 常见语义容器
+    for sel in ["main", "article", "#content", ".content", "#main", ".post", "#root"]:
+        el = soup.select_one(sel)
+        if el:
+            wrapper = BeautifulSoup("<html><head></head><body></body></html>", "lxml")
+            wrapper.head.append(wrapper.new_tag("meta", charset="utf-8"))
+            title_text = soup.title.string.strip() if soup.title and soup.title.string else base_url
+            title_tag = wrapper.new_tag("title")
+            title_tag.string = title_text
+            wrapper.head.append(title_tag)
+            fragment = BeautifulSoup(str(el), "lxml")
+            wrapper.body.append(fragment)
+            return wrapper
+
+    # 回退：全页 body
+    wrapper = BeautifulSoup("<html><head></head><body></body></html>", "lxml")
+    wrapper.head.append(wrapper.new_tag("meta", charset="utf-8"))
+    title_text = soup.title.string.strip() if soup.title and soup.title.string else base_url
+    title_tag = wrapper.new_tag("title")
+    title_tag.string = title_text
+    wrapper.head.append(title_tag)
+    body = soup.body or soup
+    fragment = BeautifulSoup(str(body), "lxml")
+    wrapper.body.append(fragment)
+    return wrapper
+
 
 def main():
-    args = parse_args()
-    ensure_tools()
+    ap = argparse.ArgumentParser(description="Convert a web page URL directly to DOCX using Pandoc.")
+    ap.add_argument("--url", required=True, help="网页 URL（支持中文）")
+    ap.add_argument("--output", "-o", default="page.docx", help="输出 DOCX 文件名")
+    ap.add_argument("--css-selector", help="可选：CSS 选择器提取主内容（如 #content, main, article）")
+    ap.add_argument("--readability", action="store_true", help="启用智能正文抽取（readability）")
+    ap.add_argument("--user-agent", help="自定义 User-Agent")
+    ap.add_argument("--timeout", type=int, default=30, help="请求超时时间（秒）")
+    ap.add_argument("--toc-depth", type=int, default=3, help="目录深度（需要传入 --toc 生效）")
+    ap.add_argument("--toc", action="store_true", help="生成目录")
+    ap.add_argument("--reference-docx", help="可选：自定义样式模板（传给 pandoc --reference-doc）")
+    args = ap.parse_args()
 
-    temp_dir = None
+    # 处理并解码中文 URL
+    raw_url = args.url.strip()
+    parsed = urlparse(raw_url)
+    if not parsed.scheme:
+        print(f"错误：URL 缺少协议（例如 https://）：{raw_url}", file=sys.stderr)
+        sys.exit(1)
+
     try:
-        repo_input = args.repo.strip()
+        final_url, html = fetch_html(raw_url, user_agent=args.user_agent, timeout=args.timeout)
+    except Exception as e:
+        print(f"抓取失败：{e}", file=sys.stderr)
+        sys.exit(1)
 
-        # 本地路径优先
-        local_path = Path(unquote(repo_input)).expanduser()
-        if local_path.exists() and local_path.is_dir():
-            working_dir = local_path.resolve()
-        else:
-            # 远程：将 URL/ssh 统一转换为 .wiki.git
-            if is_remote(repo_input):
-                remote = to_wiki_git_remote(repo_input)
-                print(f"解析远程地址：{repo_input} -> {remote}")
-                temp_dir = clone_repo(remote)
-                working_dir = temp_dir
-            else:
-                print(f"错误：无法识别的输入（既不是本地路径，也不是 URL/SSH 地址）：{repo_input}", file=sys.stderr)
-                sys.exit(1)
+    # 提取主体并修正资源链接
+    doc = extract_main(html, final_url, args.css_selector, args.readability)
+    absolutize_resources(doc, final_url)
 
-        md_files = collect_md_files(working_dir)
-        if not md_files:
-            print("未找到任何 Markdown 文件。", file=sys.stderr)
-            sys.exit(1)
+    # 写入临时 HTML 文件
+    tmpdir = Path(tempfile.mkdtemp(prefix="url2docx-"))
+    try:
+        html_path = tmpdir / "page.html"
+        html_path.write_text(str(doc), encoding="utf-8")
 
-        print("将按以下序列合并为 DOCX：")
-        for i, f in enumerate(md_files, 1):
-            print(f"{i:02d}. {f.name}")
-
-        output_path = Path(args.output).expanduser().resolve()
+        # 组装 pandoc 命令
         cmd = [
             "pandoc",
-            "--from", "gfm",
+            "--from", "html",
             "--to", "docx",
-            "--output", str(output_path),
             "--standalone",
-            "--toc",
-            f"--toc-depth={args.toc_depth}",
-            f"--resource-path={str(working_dir)}",
+            "--output", str(Path(args.output).expanduser().resolve()),
         ]
+        if args.toc:
+            cmd.extend(["--toc", f"--toc-depth={args.toc_depth}"])
         if args.reference_docx:
             cmd.extend(["--reference-doc", str(Path(args.reference_docx).expanduser().resolve())])
-        cmd.extend([str(p) for p in md_files])
 
-        run(cmd, cwd=str(working_dir))
-        print(f"已生成：{output_path}")
+        # 注意：对于 DOCX，pandoc 会将图片等资源打包进文档。我们已经将相对 URL 变为绝对 URL。
+        cmd.append(str(html_path))
 
+        run(cmd)
+        print(f"已生成：{Path(args.output).resolve()}")
     finally:
-        if temp_dir and not args.keep_clone:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        # 清理临时目录
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     main()
