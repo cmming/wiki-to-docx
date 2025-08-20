@@ -5,7 +5,7 @@ on:
       wiki_url:
         description: "GitHub Wiki: 支持 .wiki.git、仓库 URL 或 wiki 页面 URL"
         required: true
-        default: https://github.com/coze-dev/coze-studio.wiki.git
+        default: https://github.com/coze-dev/coze-studio/wiki/6.-API-%E5%8F%82%E8%80%83
       output_name:
         description: "输出 docx 文件名"
         required: true
