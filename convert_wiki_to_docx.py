@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 WIKI_SPECIALS = {"_Sidebar.md", "_Footer.md", "_Header.md", "README.md"}
 
@@ -22,15 +23,55 @@ def run(cmd, cwd=None):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Convert a GitHub Wiki repo to a single DOCX via pandoc.")
-    p.add_argument("--repo", required=True, help="Git URL or local path to the wiki repo (e.g. https://github.com/owner/repo.wiki.git)")
-    p.add_argument("--output", "-o", default="wiki.docx", help="Output DOCX filename (default: wiki.docx)")
-    p.add_argument("--reference-docx", help="Optional reference .docx for styling (pandoc --reference-doc)")
-    p.add_argument("--toc-depth", type=int, default=3, help="TOC depth (default: 3)")
-    p.add_argument("--keep-clone", action="store_true", help="Keep temp clone directory if cloning from URL")
+    p.add_argument("--repo", required=True, help="支持以下形式：.wiki.git、仓库 URL、Wiki 页面 URL、或本地路径")
+    p.add_argument("--output", "-o", default="wiki.docx", help="输出 DOCX 文件名 (default: wiki.docx)")
+    p.add_argument("--reference-docx", help="可选：自定义样式 .docx（传给 pandoc --reference-doc）")
+    p.add_argument("--toc-depth", type=int, default=3, help="目录深度 (default: 3)")
+    p.add_argument("--keep-clone", action="store_true", help="若从远程克隆：保留临时目录")
     return p.parse_args()
 
-def is_git_url(s: str) -> bool:
-    return s.startswith("http://") or s.startswith("https://") or s.endswith(".git")
+def is_remote(s: str) -> bool:
+    s = s.strip()
+    return s.startswith(("http://", "https://", "git@"))
+
+def to_wiki_git_remote(s: str) -> str:
+    """
+    将常见的 GitHub 仓库 URL 或 Wiki 页面 URL 规范化为 .wiki.git 远程地址。
+    同时兼容已是 .wiki.git 的情形；兼容 git@ 形式。
+    """
+    s = s.strip()
+
+    # 已是 .wiki.git
+    if s.endswith(".wiki.git"):
+        return s
+
+    # git@ 形式：git@host:owner/repo(.git|.wiki.git)?
+    if s.startswith("git@"):
+        m = re.match(r"^git@([^:]+):([^/]+)/(.+?)(?:\.git|\.wiki\.git)?$", s)
+        if m:
+            host, owner, repo = m.groups()
+            if repo.endswith(".wiki"):
+                repo = repo[:-5]
+            return f"git@{host}:{owner}/{repo}.wiki.git"
+        return s
+
+    # http(s) 形式：处理 github.com/{owner}/{repo} 或 github.com/{owner}/{repo}/wiki/...
+    if s.startswith(("http://", "https://")):
+        u = urlparse(s)
+        path = u.path.strip("/")
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 2:
+            owner = parts[0]
+            repo = parts[1]
+            # 去掉可能的 .git 或 .wiki 后缀
+            if repo.endswith(".git"):
+                repo = repo[:-4]
+            if repo.endswith(".wiki"):
+                repo = repo[:-5]
+            return f"{u.scheme}://{u.netloc}/{owner}/{repo}.wiki.git"
+
+    # 其他情况：原样返回（可能是本地路径或不可识别的远程）
+    return s
 
 def clone_repo(repo_url: str) -> Path:
     tmpdir = Path(tempfile.mkdtemp(prefix="wiki-clone-"))
@@ -115,13 +156,21 @@ def main():
 
     temp_dir = None
     try:
-        if is_git_url(args.repo):
-            temp_dir = clone_repo(args.repo)
-            working_dir = temp_dir
+        repo_input = args.repo.strip()
+
+        # 本地路径优先
+        local_path = Path(repo_input).expanduser()
+        if local_path.exists() and local_path.is_dir():
+            working_dir = local_path.resolve()
         else:
-            working_dir = Path(args.repo).expanduser().resolve()
-            if not working_dir.exists():
-                print(f"错误：路径不存在：{working_dir}", file=sys.stderr)
+            # 远程：将 URL/ssh 统一转换为 .wiki.git
+            if is_remote(repo_input):
+                remote = to_wiki_git_remote(repo_input)
+                print(f"解析远程地址：{repo_input} -> {remote}")
+                temp_dir = clone_repo(remote)
+                working_dir = temp_dir
+            else:
+                print(f"错误：无法识别的输入（既不是本地路径，也不是 URL/SSH 地址）：{repo_input}", file=sys.stderr)
                 sys.exit(1)
 
         md_files = collect_md_files(working_dir)
@@ -129,7 +178,7 @@ def main():
             print("未找到任何 Markdown 文件。", file=sys.stderr)
             sys.exit(1)
 
-        print("将按以下顺序合并为 DOCX：")
+        print("将按以下序列合并为 DOCX：")
         for i, f in enumerate(md_files, 1):
             print(f"{i:02d}. {f.name}")
 

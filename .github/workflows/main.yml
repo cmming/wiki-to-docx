@@ -3,11 +3,11 @@ on:
   workflow_dispatch:
     inputs:
       wiki_url:
-        description: "GitHub wiki git URL (.wiki.git)"
+        description: "GitHub Wiki: 支持 .wiki.git、仓库 URL 或 wiki 页面 URL"
         required: true
         default: https://github.com/coze-dev/coze-studio.wiki.git
       output_name:
-        description: "Output docx file name"
+        description: "输出 docx 文件名"
         required: true
         default: coze-studio-wiki.docx
 
